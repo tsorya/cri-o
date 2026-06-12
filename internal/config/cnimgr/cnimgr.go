@@ -24,7 +24,8 @@ type CNIManager struct {
 	mutex               sync.RWMutex
 	cancel              context.CancelFunc
 	initPollInterval    time.Duration
-	monitorPollInterval time.Duration
+	healthyPollInterval time.Duration
+	failurePollInterval time.Duration
 	gracePeriod         time.Duration
 	firstFailureTime    time.Time
 
@@ -47,7 +48,8 @@ func New(defaultNetwork, networkDir string, gracePeriod time.Duration, pluginDir
 		lastError:           errors.New("plugin status uninitialized"),
 		cancel:              cancel,
 		initPollInterval:    500 * time.Millisecond,
-		monitorPollInterval: 5 * time.Second,
+		healthyPollInterval: 30 * time.Second,
+		failurePollInterval: 5 * time.Second,
 		gracePeriod:         gracePeriod,
 	}
 
@@ -76,16 +78,36 @@ func (c *CNIManager) pollContinuously(ctx context.Context) {
 		return
 	}
 
-	logrus.Infof("Continuous CNI STATUS monitoring enabled (grace period: %v, poll interval: %v)", c.gracePeriod, c.monitorPollInterval)
+	logrus.Infof("Continuous CNI STATUS monitoring enabled (grace period: %v, poll: %v healthy / %v failure)",
+		c.gracePeriod, c.healthyPollInterval, c.failurePollInterval)
 
-	// Phase 2: slow poll to continuously monitor plugin health.
-	// If the plugin becomes unhealthy, lastError is set so that
-	// ReadyOrError() reports not-ready and kubelet sees NetworkReady=false.
-	//nolint:errcheck // error is intentionally ignored, status is tracked via lastError
-	wait.PollUntilContextCancel(ctx, c.monitorPollInterval, true,
-		func(ctx context.Context) (bool, error) {
-			return c.statusPollFunc(ctx, false)
-		})
+	// Phase 2: adaptive poll to continuously monitor plugin health.
+	// Uses a slow interval when healthy to minimize CPU overhead, and
+	// switches to fast polling during the grace period for precise
+	// failure tracking.
+	for {
+		c.statusPollFunc(ctx, false)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(c.nextPollInterval()):
+		}
+	}
+}
+
+// nextPollInterval returns the appropriate interval for the next STATUS poll.
+// Fast polling during an active grace period (failure detected but not yet
+// reported); slow polling otherwise to minimize CPU overhead.
+func (c *CNIManager) nextPollInterval() time.Duration {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	if !c.firstFailureTime.IsZero() && c.lastError == nil {
+		return c.failurePollInterval
+	}
+
+	return c.healthyPollInterval
 }
 
 func (c *CNIManager) statusPollFunc(ctx context.Context, isStartup bool) (bool, error) {

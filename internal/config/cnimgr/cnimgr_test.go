@@ -17,9 +17,10 @@ const (
 )
 
 type fakeCNIPlugin struct {
-	mu        sync.Mutex
-	statusErr error
-	gcCalls   atomic.Int32
+	mu          sync.Mutex
+	statusErr   error
+	gcCalls     atomic.Int32
+	statusCalls atomic.Int64
 }
 
 func (f *fakeCNIPlugin) setStatusErr(err error) {
@@ -46,7 +47,11 @@ func (f *fakeCNIPlugin) GC(context.Context, []*ocicni.PodNetwork) error {
 	return nil
 }
 
-func (f *fakeCNIPlugin) StatusWithContext(context.Context) error { return f.Status() }
+func (f *fakeCNIPlugin) StatusWithContext(context.Context) error {
+	f.statusCalls.Add(1)
+
+	return f.Status()
+}
 
 func (f *fakeCNIPlugin) SetUpPod(ocicni.PodNetwork) ([]ocicni.NetResult, error) {
 	return nil, nil
@@ -545,7 +550,8 @@ func newTestManagerWithGrace(plugin *fakeCNIPlugin, gracePeriod time.Duration) *
 		lastError:           errors.New("plugin status uninitialized"),
 		cancel:              cancel,
 		initPollInterval:    testPollInterval,
-		monitorPollInterval: testPollInterval,
+		healthyPollInterval: testPollInterval,
+		failurePollInterval: testPollInterval,
 		gracePeriod:         gracePeriod,
 	}
 
@@ -641,6 +647,50 @@ func TestGracePeriod(t *testing.T) {
 		waitFor(t, "unhealthy after small grace", func() bool {
 			return mgr.ReadyOrError() != nil
 		})
+	})
+
+	t.Run("adaptive polling uses fast interval during grace period", func(t *testing.T) {
+		fake := &fakeCNIPlugin{}
+		gracePeriod := 2 * time.Second
+
+		ctx, cancel := context.WithCancel(context.Background())
+		mgr := &CNIManager{
+			plugin:              fake,
+			lastError:           errors.New("plugin status uninitialized"),
+			cancel:              cancel,
+			initPollInterval:    testPollInterval,
+			healthyPollInterval: 100 * time.Millisecond,
+			failurePollInterval: 10 * time.Millisecond,
+			gracePeriod:         gracePeriod,
+		}
+
+		go mgr.pollContinuously(ctx)
+		defer mgr.Shutdown()
+
+		waitFor(t, "ready", func() bool {
+			return mgr.ReadyOrError() == nil
+		})
+
+		countBefore := fake.statusCalls.Load()
+
+		// While healthy, poll rate is slow (100ms intervals).
+		// Over 250ms we expect ~2-3 calls.
+		time.Sleep(250 * time.Millisecond)
+		healthyCalls := fake.statusCalls.Load() - countBefore
+
+		// Inject failure to trigger fast polling
+		fake.setStatusErr(errors.New("disruption"))
+		countBefore = fake.statusCalls.Load()
+
+		// During grace period, poll rate is fast (10ms intervals).
+		// Over 250ms we expect many more calls than during healthy.
+		time.Sleep(250 * time.Millisecond)
+		failureCalls := fake.statusCalls.Load() - countBefore
+
+		if failureCalls <= healthyCalls {
+			t.Fatalf("expected more polls during grace period (%d) than healthy (%d)",
+				failureCalls, healthyCalls)
+		}
 	})
 
 	t.Run("grace period timer resets after full recovery", func(t *testing.T) {

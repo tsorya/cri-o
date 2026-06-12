@@ -356,12 +356,12 @@ function check_networking() {
 	[[ "$output" == "SANDBOX_READY" ]]
 }
 
-# Wait for a log message with a configurable timeout (default 15s).
+# Wait for a log message with a configurable timeout (default 45s).
 # The built-in wait_for_log has a fixed ~5s timeout which is too short
-# for CNI STATUS monitoring (5s poll interval means up to 10s for events).
+# for CNI STATUS monitoring (30s healthy poll interval).
 function wait_for_cni_log() {
 	local pattern="$1"
-	local max_wait="${2:-150}" # 150 * 0.1s = 15s default
+	local max_wait="${2:-450}" # 450 * 0.1s = 45s default
 	local cnt=0
 	while ! grep -q "$pattern" "$CRIO_LOG" 2> /dev/null; do
 		if [[ $cnt -gt $max_wait ]]; then
@@ -435,8 +435,9 @@ EOF
 	# Remove the failure before grace period expires
 	rm -f "$TESTDIR/cni_plugin_status_failing"
 
-	# Allow a couple of poll cycles for the plugin to be re-checked
-	sleep 2
+	# During grace period the monitor polls every 5s; wait for one full
+	# cycle so the plugin is re-checked and found healthy.
+	sleep 6
 
 	# Node should still be network-ready (grace period was not exceeded)
 	output=$(crictl info -o json | jq -r '.status.conditions[] | select(.type == "NetworkReady") | .status')
@@ -464,8 +465,9 @@ EOF
 	wait_for_cni_log "Continuous CNI STATUS monitoring enabled"
 
 	# Trigger a persistent CNI failure and wait for the grace period to expire.
-	# The monitor polls every 5s, so the "beyond grace period" log needs 2 polls
-	# (~10s): first poll sets the timer, second poll finds grace (1s) expired.
+	# The healthy poll interval is 30s; once a failure is detected the monitor
+	# switches to 5s polling. The first failure detection can take up to 30s,
+	# then the 1s grace expires on the next 5s poll.
 	touch "$TESTDIR/cni_plugin_status_failing"
 	wait_for_cni_log "CNI plugin unhealthy beyond grace period"
 
